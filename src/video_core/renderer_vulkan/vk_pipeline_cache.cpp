@@ -146,6 +146,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         }
         gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
+        gs_info.mode = regs.vgt_gs_mode.mode;
         const auto params_vc = Liverpool::GetParams(regs.vs_program);
         gs_info.vs_copy = params_vc.code;
         gs_info.vs_copy_hash = params_vc.hash;
@@ -158,6 +159,15 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.fs_info.addr_flags = regs.ps_input_addr;
         const auto& ps_inputs = regs.ps_inputs;
         info.fs_info.num_inputs = regs.num_interp;
+        const auto& cb0_blend = regs.blend_control[0];
+        info.fs_info.dual_source_blending =
+            LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_dst_factor) ||
+            LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_src_factor);
+        if (cb0_blend.separate_alpha_blend) {
+            info.fs_info.dual_source_blending |=
+                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_dst_factor) ||
+                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_src_factor);
+        }
         for (u32 i = 0; i < regs.num_interp; i++) {
             info.fs_info.inputs[i] = {
                 .param_index = u8(ps_inputs[i].input_offset.Value()),
@@ -200,7 +210,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
-        .support_explicit_workgroup_layout = true,
         .support_legacy_vertex_attributes = instance_.IsLegacyVertexAttributesSupported(),
         .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
         .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
@@ -208,6 +217,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // TODO: Emitted bounds checks cause problems with phi control flow; needs to be fixed.
         .supports_robust_buffer_access = true, // instance_.IsRobustBufferAccess2Supported(),
         .supports_image_fp32_atomic_min_max = instance_.IsShaderAtomicFloatImage32MinMaxSupported(),
+        .supports_workgroup_explicit_memory_layout =
+            instance_.IsWorkgroupMemoryExplicitLayoutSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -372,7 +383,12 @@ bool PipelineCache::RefreshGraphicsKey() {
             infos[stage_out_idx] = nullptr;
             return false;
         }
-
+#ifdef SHADER_SKIPPING
+        if (Config::ShouldSkipShader(bininfo.shader_hash)) {
+            LOG_WARNING(Render_Vulkan, "Skipped graphics shader hash {:#x}.", bininfo.shader_hash);
+            return false;
+        }
+#endif
         auto params = Liverpool::GetParams(*pgm);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
@@ -481,6 +497,12 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = Liverpool::GetParams(cs_pgm);
+#ifdef SHADER_SKIPPING
+    if (Config::ShouldSkipShader(cs_params.hash)) {
+        LOG_WARNING(Render_Vulkan, "Skipped compute shader hash {:#x}.", cs_params.hash);
+        return false;
+    }
+#endif
     std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
         GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
     return true;
